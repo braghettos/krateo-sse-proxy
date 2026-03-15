@@ -242,7 +242,7 @@ func (p *poller) run(ctx context.Context) {
 
 func (p *poller) poll() {
 	query := fmt.Sprintf(pollSQL, p.lastSeenUnix)
-	rows, err := p.queryClickHouse(query)
+	rows, err := queryClickHouse(p.cfg, query)
 	if err != nil {
 		log.Printf("[poller] query error: %v", err)
 		return
@@ -280,14 +280,18 @@ func (p *poller) poll() {
 	}
 }
 
-func (p *poller) queryClickHouse(query string) ([]chRow, error) {
-	req, err := http.NewRequest(http.MethodPost, p.cfg.clickhouseURL, strings.NewReader(query))
+// ---------------------------------------------------------------------------
+// Shared ClickHouse query helper
+// ---------------------------------------------------------------------------
+
+func queryClickHouse(cfg config, query string) ([]chRow, error) {
+	req, err := http.NewRequest(http.MethodPost, cfg.clickhouseURL, strings.NewReader(query))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "text/plain")
-	if p.cfg.clickhouseUser != "" {
-		req.SetBasicAuth(p.cfg.clickhouseUser, p.cfg.clickhousePassword)
+	if cfg.clickhouseUser != "" {
+		req.SetBasicAuth(cfg.clickhouseUser, cfg.clickhousePassword)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
@@ -304,7 +308,6 @@ func (p *poller) queryClickHouse(query string) ([]chRow, error) {
 		return nil, fmt.Errorf("clickhouse returned %d: %s", resp.StatusCode, body)
 	}
 
-	// FORMAT JSONEachRow: one JSON object per newline.
 	var rows []chRow
 	for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
 		if line == "" {
@@ -312,12 +315,64 @@ func (p *poller) queryClickHouse(query string) ([]chRow, error) {
 		}
 		var row chRow
 		if err := json.Unmarshal([]byte(line), &row); err != nil {
-			log.Printf("[poller] unmarshal error: %v (line=%s)", err, line)
+			log.Printf("[query] unmarshal error: %v (line=%s)", err, line)
 			continue
 		}
 		rows = append(rows, row)
 	}
 	return rows, nil
+}
+
+// ---------------------------------------------------------------------------
+// REST /events – returns recent K8s events as a plain JSON array of EventV1.
+// The frontend's useGetEvents hook calls EVENTS_API_BASE_URL + "/events" and
+// expects (await res.json()) as SSEK8sEvent[].
+// ---------------------------------------------------------------------------
+
+const eventsSQL = `SELECT
+    toUnixTimestamp(Timestamp)                                                      AS ts_unix,
+    ifNull(LogAttributes['krateo.io/composition-id'], '')                           AS composition_id,
+    ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'apiVersion'), '')   AS obj_apiversion,
+    ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'name'), '')         AS obj_name,
+    ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'namespace'), '')    AS obj_namespace,
+    ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'uid'), '')          AS obj_uid,
+    ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'kind'), '')         AS obj_kind,
+    ifNull(JSONExtractString(Body, 'object', 'reason'), '')                         AS reason,
+    ifNull(JSONExtractString(Body, 'object', 'message'), '')                        AS message,
+    ifNull(JSONExtractString(Body, 'object', 'type'), 'Normal')                     AS type,
+    coalesce(
+        nullIf(JSONExtractString(Body, 'object', 'eventTime'), ''),
+        nullIf(JSONExtractString(Body, 'object', 'lastTimestamp'), ''),
+        formatDateTime(toDateTime(Timestamp), '%%Y-%%m-%%dT%%H:%%i:%%SZ', 'UTC')
+    )                                                                                AS event_time,
+    ifNull(JSONExtractString(Body, 'object', 'source', 'component'), '')            AS source_component
+FROM otel_logs
+WHERE ResourceAttributes['telemetry.source'] = 'k8s-events'
+  AND JSONExtractString(Body, 'object', 'reason') != ''
+ORDER BY Timestamp DESC
+LIMIT 200
+FORMAT JSONEachRow`
+
+func handleEvents(cfg config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rows, err := queryClickHouse(cfg, eventsSQL)
+		if err != nil {
+			log.Printf("[/events] query error: %v", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+
+		events := make([]SSEK8sEvent, 0, len(rows))
+		for _, row := range rows {
+			events = append(events, row.toSSEK8sEvent())
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if err := json.NewEncoder(w).Encode(events); err != nil {
+			log.Printf("[/events] encode error: %v", err)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +438,7 @@ func main() {
 	go p.run(ctx)
 
 	mux := http.NewServeMux()
-	// Accept both /notifications and /notifications/ to match frontend behaviour.
+	mux.HandleFunc("/events", handleEvents(cfg))
 	mux.HandleFunc("/notifications/", handleSSE(h))
 	mux.HandleFunc("/notifications", handleSSE(h))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
