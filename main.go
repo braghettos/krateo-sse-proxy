@@ -35,10 +35,11 @@ type SSEK8sEvent struct {
 		CreationTimestamp string `json:"creationTimestamp"`
 	} `json:"metadata"`
 	InvolvedObject struct {
-		Kind      string `json:"kind"`
-		Name      string `json:"name"`
-		Namespace string `json:"namespace"`
-		UID       string `json:"uid"`
+		APIVersion string `json:"apiVersion"`
+		Kind       string `json:"kind"`
+		Name       string `json:"name"`
+		Namespace  string `json:"namespace"`
+		UID        string `json:"uid"`
 	} `json:"involvedObject"`
 	Reason        string `json:"reason"`
 	Message       string `json:"message"`
@@ -61,6 +62,7 @@ type SSEK8sEvent struct {
 type chRow struct {
 	TsUnix          int64  `json:"ts_unix"`
 	CompositionID   string `json:"composition_id"`
+	ObjAPIVersion   string `json:"obj_apiversion"`
 	ObjName         string `json:"obj_name"`
 	ObjNamespace    string `json:"obj_namespace"`
 	ObjUID          string `json:"obj_uid"`
@@ -78,6 +80,7 @@ func (row chRow) toSSEK8sEvent() SSEK8sEvent {
 	evt.Metadata.Namespace = row.ObjNamespace
 	evt.Metadata.UID = row.ObjUID
 	evt.Metadata.CreationTimestamp = row.EventTime
+	evt.InvolvedObject.APIVersion = row.ObjAPIVersion
 	evt.InvolvedObject.Kind = row.ObjKind
 	evt.InvolvedObject.Name = row.ObjName
 	evt.InvolvedObject.Namespace = row.ObjNamespace
@@ -183,6 +186,7 @@ func getEnv(key, fallback string) string {
 const pollSQL = `SELECT
     toUnixTimestamp(Timestamp)                                                      AS ts_unix,
     ifNull(LogAttributes['krateo.io/composition-id'], '')                           AS composition_id,
+    ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'apiVersion'), '')   AS obj_apiversion,
     ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'name'), '')         AS obj_name,
     ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'namespace'), '')    AS obj_namespace,
     ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'uid'), '')          AS obj_uid,
