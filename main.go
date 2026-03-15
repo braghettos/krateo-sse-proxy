@@ -250,21 +250,22 @@ func (p *poller) poll() {
 			maxTs = row.TsUnix
 		}
 
-		topic := row.CompositionID
-		if topic == "" {
-			topic = row.ObjNamespace
-		}
-		if topic == "" {
-			continue
-		}
-
 		evt := row.toSSEK8sEvent()
 		data, err := json.Marshal(evt)
 		if err != nil {
 			log.Printf("[poller] marshal error: %v", err)
 			continue
 		}
-		p.hub.broadcast(sseMessage{topic: topic, data: data})
+
+		// Global topic — mirrors eventsse behaviour where all events
+		// are published under the "krateo" topic.
+		p.hub.broadcast(sseMessage{topic: "krateo", data: data})
+
+		// Composition-specific topic so per-composition listeners
+		// only receive their own events.
+		if row.CompositionID != "" {
+			p.hub.broadcast(sseMessage{topic: row.CompositionID, data: data})
+		}
 	}
 
 	if maxTs > p.lastSeenUnix {
