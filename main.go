@@ -53,41 +53,38 @@ type SSEK8sEvent struct {
 
 // ---------------------------------------------------------------------------
 // chRow – a row returned by the ClickHouse polling query (JSONEachRow format).
+// Fields are extracted from the raw K8s event JSON stored in otel_logs.Body
+// by the k8sobjects receiver, and the composition ID is enriched by the
+// compositionresolver OTel processor.
 // ---------------------------------------------------------------------------
 
 type chRow struct {
 	TsUnix          int64  `json:"ts_unix"`
 	CompositionID   string `json:"composition_id"`
 	ObjName         string `json:"obj_name"`
+	ObjNamespace    string `json:"obj_namespace"`
 	ObjUID          string `json:"obj_uid"`
 	ObjKind         string `json:"obj_kind"`
-	Namespace       string `json:"namespace"`
 	Reason          string `json:"reason"`
-	SourceComponent string `json:"source_component"`
-	Severity        string `json:"severity"`
 	Message         string `json:"message"`
+	Type            string `json:"type"`
 	EventTime       string `json:"event_time"`
+	SourceComponent string `json:"source_component"`
 }
 
 func (row chRow) toSSEK8sEvent() SSEK8sEvent {
-	eventType := "Normal"
-	sev := strings.ToUpper(row.Severity)
-	if sev == "WARN" || sev == "WARNING" || sev == "ERROR" || sev == "FATAL" {
-		eventType = "Warning"
-	}
-
 	var evt SSEK8sEvent
 	evt.Metadata.Name = row.ObjName
-	evt.Metadata.Namespace = row.Namespace
+	evt.Metadata.Namespace = row.ObjNamespace
 	evt.Metadata.UID = row.ObjUID
 	evt.Metadata.CreationTimestamp = row.EventTime
 	evt.InvolvedObject.Kind = row.ObjKind
 	evt.InvolvedObject.Name = row.ObjName
-	evt.InvolvedObject.Namespace = row.Namespace
+	evt.InvolvedObject.Namespace = row.ObjNamespace
 	evt.InvolvedObject.UID = row.ObjUID
 	evt.Reason = row.Reason
 	evt.Message = row.Message
-	evt.Type = eventType
+	evt.Type = row.Type
 	evt.FirstTimestamp = row.EventTime
 	evt.LastTimestamp = row.EventTime
 	evt.EventTime = row.EventTime
@@ -180,21 +177,28 @@ func getEnv(key, fallback string) string {
 // ---------------------------------------------------------------------------
 
 // pollSQL fetches K8s events from otel_logs that arrived after lastSeenUnix.
+// Events are stored as raw JSON in Body by the k8sobjects receiver.
+// The compositionresolver processor enriches LogAttributes with krateo.io/composition-id.
 // %%Y, %%m etc. become %Y, %m after fmt.Sprintf substitutes %d for the timestamp.
 const pollSQL = `SELECT
-    toUnixTimestamp(Timestamp)                                          AS ts_unix,
-    ifNull(ResourceAttributes['krateo.composition.id'], '')            AS composition_id,
-    ifNull(ResourceAttributes['k8s.object.name'], '')                  AS obj_name,
-    ifNull(ResourceAttributes['k8s.object.uid'], '')                   AS obj_uid,
-    ifNull(ResourceAttributes['k8s.object.kind'], '')                  AS obj_kind,
-    ifNull(ResourceAttributes['k8s.namespace.name'], '')               AS namespace,
-    ifNull(ResourceAttributes['k8s.event.reason'], '')                 AS reason,
-    ifNull(ResourceAttributes['k8s.event.source.component'], '')       AS source_component,
-    ifNull(SeverityText, '')                                           AS severity,
-    ifNull(Body, '')                                                   AS message,
-    formatDateTime(toDateTime(Timestamp), '%%Y-%%m-%%dT%%H:%%i:%%SZ', 'UTC') AS event_time
+    toUnixTimestamp(Timestamp)                                                      AS ts_unix,
+    ifNull(LogAttributes['krateo.io/composition-id'], '')                           AS composition_id,
+    ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'name'), '')         AS obj_name,
+    ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'namespace'), '')    AS obj_namespace,
+    ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'uid'), '')          AS obj_uid,
+    ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'kind'), '')         AS obj_kind,
+    ifNull(JSONExtractString(Body, 'object', 'reason'), '')                         AS reason,
+    ifNull(JSONExtractString(Body, 'object', 'message'), '')                        AS message,
+    ifNull(JSONExtractString(Body, 'object', 'type'), 'Normal')                     AS type,
+    coalesce(
+        nullIf(JSONExtractString(Body, 'object', 'eventTime'), ''),
+        nullIf(JSONExtractString(Body, 'object', 'lastTimestamp'), ''),
+        formatDateTime(toDateTime(Timestamp), '%%Y-%%m-%%dT%%H:%%i:%%SZ', 'UTC')
+    )                                                                                AS event_time,
+    ifNull(JSONExtractString(Body, 'object', 'source', 'component'), '')            AS source_component
 FROM otel_logs
-WHERE ResourceAttributes['k8s.event.reason'] != ''
+WHERE ResourceAttributes['telemetry.source'] = 'k8s-events'
+  AND JSONExtractString(Body, 'object', 'reason') != ''
   AND toUnixTimestamp(Timestamp) > %d
 ORDER BY Timestamp ASC
 LIMIT 500
@@ -248,8 +252,7 @@ func (p *poller) poll() {
 
 		topic := row.CompositionID
 		if topic == "" {
-			// Fall back to namespace so namespace-scoped clients can still receive events.
-			topic = row.Namespace
+			topic = row.ObjNamespace
 		}
 		if topic == "" {
 			continue
