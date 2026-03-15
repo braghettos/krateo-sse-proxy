@@ -1,0 +1,90 @@
+---
+# Deployment for the Krateo SSE proxy.
+# Polls ClickHouse every 3 s and pushes new K8s events to connected browsers
+# via Server-Sent Events at /notifications/.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: krateo-sse-proxy
+  namespace: krateo-system
+  labels:
+    app.kubernetes.io/name: krateo-sse-proxy
+    app.kubernetes.io/component: sse-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: krateo-sse-proxy
+  template:
+    metadata:
+      labels:
+        app: krateo-sse-proxy
+        app.kubernetes.io/name: krateo-sse-proxy
+    spec:
+      serviceAccountName: default
+      containers:
+        - name: sse-proxy
+          # Built and pushed by .github/workflows/sse-proxy.yaml
+          image: ghcr.io/braghettos/krateo-sse-proxy:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: CLICKHOUSE_URL
+              value: "http://krateo-clickstack-clickhouse.clickhouse-system.svc:8123"
+            - name: CLICKHOUSE_USER
+              value: "default"
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: clickhouse-credentials
+                  key: password
+                  optional: true
+            - name: LISTEN_ADDR
+              value: ":8080"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            limits:
+              cpu: 200m
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 32Mi
+          securityContext:
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+      securityContext:
+        runAsNonRoot: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: krateo-sse-proxy
+  namespace: krateo-system
+  labels:
+    app.kubernetes.io/name: krateo-sse-proxy
+spec:
+  selector:
+    app: krateo-sse-proxy
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP
