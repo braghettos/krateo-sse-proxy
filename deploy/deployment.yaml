@@ -33,7 +33,7 @@ spec:
               protocol: TCP
           env:
             - name: CLICKHOUSE_URL
-              value: "http://krateo-clickstack-clickhouse.clickhouse-system.svc:8123"
+              value: "http://krateo-clickstack-clickhouse-clickhouse-headless.clickhouse-system.svc:8123"
             - name: CLICKHOUSE_USER
               value: "default"
             - name: CLICKHOUSE_PASSWORD
