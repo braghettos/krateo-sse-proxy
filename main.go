@@ -17,8 +17,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -446,8 +448,28 @@ func main() {
 		fmt.Fprint(w, "ok")
 	})
 
+	srv := &http.Server{
+		Addr:    cfg.listenAddr,
+		Handler: mux,
+	}
+
+	// Graceful shutdown on SIGTERM/SIGINT (Kubernetes sends SIGTERM on pod stop).
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		sig := <-sigCh
+		log.Printf("[sse-proxy] received %v, shutting down gracefully...", sig)
+		cancel()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[sse-proxy] shutdown error: %v", err)
+		}
+	}()
+
 	log.Printf("[sse-proxy] listening on %s", cfg.listenAddr)
-	if err := http.ListenAndServe(cfg.listenAddr, mux); err != nil {
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("[sse-proxy] fatal: %v", err)
 	}
+	log.Println("[sse-proxy] stopped")
 }
