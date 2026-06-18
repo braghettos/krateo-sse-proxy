@@ -1,0 +1,3 @@
+# Compiled binaries from `go build`
+/krateo-sse-proxy
+/sse-proxy
