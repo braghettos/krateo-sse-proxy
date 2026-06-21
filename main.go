@@ -6,7 +6,21 @@
 // for SSE messages whose `event:` field matches the compositionId. Each SSE
 // message `data:` field contains a single SSEK8sEvent JSON object.
 //
-// No external dependencies – only the Go standard library is used.
+// Endpoints:
+//
+//	GET /events         JSON snapshot of recent events (SSEK8sEvent[]). Optional
+//	                    query params: composition_id (UUID; server-side filter)
+//	                    and limit (1..200, default 200).
+//	GET /notifications  the SSE stream. Optional composition_id query param
+//	                    subscribes to a single composition's events; absent ⇒
+//	                    the global firehose (client filters by SSE event name).
+//	GET /health         unauthenticated liveness/readiness probe.
+//
+// /events and /notifications validate a krateo JWT the same way snowplow does
+// (HS256 against the shared JWT_SIGN_KEY secret) when that secret is set; see
+// auth.go. The only external dependency is the krateo plumbing JWT helper
+// (github.com/krateoplatformops/plumbing) plus its golang-jwt transitive; the
+// ClickHouse polling + SSE hub remain pure standard library.
 package main
 
 import (
@@ -16,8 +30,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -43,15 +60,20 @@ type SSEK8sEvent struct {
 		Namespace  string `json:"namespace"`
 		UID        string `json:"uid"`
 	} `json:"involvedObject"`
-	Reason        string `json:"reason"`
-	Message       string `json:"message"`
-	Type          string `json:"type"` // "Normal" | "Warning"
+	Reason         string `json:"reason"`
+	Message        string `json:"message"`
+	Type           string `json:"type"` // "Normal" | "Warning"
 	FirstTimestamp string `json:"firstTimestamp"`
 	LastTimestamp  string `json:"lastTimestamp"`
 	EventTime      string `json:"eventTime"`
 	Source         struct {
 		Component string `json:"component"`
 	} `json:"source"`
+	// CompositionID is the krateo.io/composition-id the event belongs to (empty
+	// for cluster-wide events that carry no composition). Exposed so clients can
+	// see/scope events by composition. Camel-cased to match the rest of this
+	// payload (which mirrors the frontend SSEK8sEvent/EventV1 TS type).
+	CompositionID string `json:"compositionId"`
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +116,7 @@ func (row chRow) toSSEK8sEvent() SSEK8sEvent {
 	evt.LastTimestamp = row.EventTime
 	evt.EventTime = row.EventTime
 	evt.Source.Component = row.SourceComponent
+	evt.CompositionID = row.CompositionID
 	return evt
 }
 
@@ -108,6 +131,18 @@ type sseMessage struct {
 
 type client struct {
 	ch chan sseMessage
+	// topic is the single topic this client is subscribed to. Empty means
+	// "all topics" (the global firehose): the client receives every message,
+	// preserving the original behaviour where the browser filters client-side
+	// by SSE event name. A non-empty topic means the client receives ONLY
+	// messages broadcast under that exact topic (server-side per-composition
+	// subscription).
+	topic string
+}
+
+// wants reports whether this client should receive a message on the given topic.
+func (c *client) wants(topic string) bool {
+	return c.topic == "" || c.topic == topic
 }
 
 type hub struct {
@@ -136,6 +171,9 @@ func (h *hub) broadcast(msg sseMessage) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for c := range h.clients {
+		if !c.wants(msg.topic) {
+			continue
+		}
 		// Non-blocking send: drop the message for slow clients rather than blocking.
 		select {
 		case c.ch <- msg:
@@ -244,7 +282,7 @@ func (p *poller) run(ctx context.Context) {
 
 func (p *poller) poll() {
 	query := fmt.Sprintf(pollSQL, p.lastSeenUnix)
-	rows, err := queryClickHouse(p.cfg, query)
+	rows, err := queryClickHouse(p.cfg, query, nil)
 	if err != nil {
 		log.Printf("[poller] query error: %v", err)
 		return
@@ -286,8 +324,26 @@ func (p *poller) poll() {
 // Shared ClickHouse query helper
 // ---------------------------------------------------------------------------
 
-func queryClickHouse(cfg config, query string) ([]chRow, error) {
-	req, err := http.NewRequest(http.MethodPost, cfg.clickhouseURL, strings.NewReader(query))
+// queryClickHouse runs query against ClickHouse over HTTP. Any params are
+// passed as ClickHouse query parameters (param_<name>=<value> on the request
+// URL) so the SQL can reference them safely as {name:Type} placeholders —
+// values are bound by ClickHouse, never string-concatenated into the SQL.
+func queryClickHouse(cfg config, query string, params map[string]string) ([]chRow, error) {
+	endpoint := cfg.clickhouseURL
+	if len(params) > 0 {
+		u, err := url.Parse(cfg.clickhouseURL)
+		if err != nil {
+			return nil, fmt.Errorf("parse clickhouse url: %w", err)
+		}
+		q := u.Query()
+		for k, v := range params {
+			q.Set("param_"+k, v)
+		}
+		u.RawQuery = q.Encode()
+		endpoint = u.String()
+	}
+
+	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(query))
 	if err != nil {
 		return nil, err
 	}
@@ -329,9 +385,32 @@ func queryClickHouse(cfg config, query string) ([]chRow, error) {
 // REST /events – returns recent K8s events as a plain JSON array of EventV1.
 // The frontend's useGetEvents hook calls EVENTS_API_BASE_URL + "/events" and
 // expects (await res.json()) as SSEK8sEvent[].
+//
+// Query parameters (all optional):
+//   - composition_id: when present, only events for that composition are
+//     returned (server-side filter). MUST be a UUID. Absent ⇒ all events
+//     (the dashboard "all activity" view, the original behaviour).
+//   - limit: max rows to return; defaults to and is capped at defaultEventsLimit.
+//
+// SQL-injection safety: composition_id and limit are NEVER concatenated into
+// the SQL. composition_id is strictly validated as a UUID and then bound as a
+// ClickHouse query parameter ({composition_id:String}); limit is parsed to a
+// bounded integer and bound as {limit:UInt32}.
 // ---------------------------------------------------------------------------
 
-const eventsSQL = `SELECT
+// defaultEventsLimit is both the default and the hard cap for /events.
+const defaultEventsLimit = 200
+
+// compositionPredicatePlaceholder is replaced (via strings.Replace, NOT
+// fmt.Sprintf — the template contains literal ClickHouse % format directives)
+// with either an empty string or compositionIDFilter.
+const compositionPredicatePlaceholder = "/*COMPOSITION_PREDICATE*/"
+
+// eventsSQLTemplate has one placeholder for the optional composition predicate.
+// The row limit is bound via the {limit:UInt32} ClickHouse query parameter.
+// (Single % in formatDateTime is correct: this string is NOT passed through
+// fmt.Sprintf, unlike pollSQL.)
+const eventsSQLTemplate = `SELECT
     toUnixTimestamp(Timestamp)                                                      AS ts_unix,
     ifNull(LogAttributes['krateo.io/composition-id'], '')                           AS composition_id,
     ifNull(JSONExtractString(Body, 'object', 'involvedObject', 'apiVersion'), '')   AS obj_apiversion,
@@ -345,19 +424,71 @@ const eventsSQL = `SELECT
     coalesce(
         nullIf(JSONExtractString(Body, 'object', 'eventTime'), ''),
         nullIf(JSONExtractString(Body, 'object', 'lastTimestamp'), ''),
-        formatDateTime(toDateTime(Timestamp), '%%Y-%%m-%%dT%%H:%%i:%%SZ', 'UTC')
+        formatDateTime(toDateTime(Timestamp), '%Y-%m-%dT%H:%i:%SZ', 'UTC')
     )                                                                                AS event_time,
     ifNull(JSONExtractString(Body, 'object', 'source', 'component'), '')            AS source_component
 FROM otel_logs
 WHERE ResourceAttributes['telemetry.source'] = 'k8s-events'
-  AND JSONExtractString(Body, 'object', 'reason') != ''
+  AND JSONExtractString(Body, 'object', 'reason') != ''/*COMPOSITION_PREDICATE*/
 ORDER BY Timestamp DESC
-LIMIT 200
+LIMIT {limit:UInt32}
 FORMAT JSONEachRow`
+
+// compositionIDFilter is the predicate appended to the WHERE clause when a
+// composition_id is supplied. The value is bound, not interpolated.
+const compositionIDFilter = "\n  AND LogAttributes['krateo.io/composition-id'] = {composition_id:String}"
+
+// uuidRe matches an RFC 4122 UUID (the shape of a krateo composition id),
+// case-insensitively. Used to reject anything that is not a UUID before the
+// value is bound as a ClickHouse parameter (defence in depth).
+var uuidRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// parseLimit parses the `limit` query param, returning a value in
+// [1, defaultEventsLimit]. Empty/invalid/non-positive ⇒ defaultEventsLimit.
+func parseLimit(raw string) int {
+	if raw == "" {
+		return defaultEventsLimit
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return defaultEventsLimit
+	}
+	if n > defaultEventsLimit {
+		return defaultEventsLimit
+	}
+	return n
+}
+
+// buildEventsQuery returns the SQL and the bound ClickHouse parameters for the
+// given request query values. It returns an error only when composition_id is
+// present but not a valid UUID. limit is always clamped to a safe range.
+func buildEventsQuery(q url.Values) (string, map[string]string, error) {
+	params := map[string]string{
+		"limit": strconv.Itoa(parseLimit(q.Get("limit"))),
+	}
+
+	predicate := ""
+	if cid := q.Get("composition_id"); cid != "" {
+		if !uuidRe.MatchString(cid) {
+			return "", nil, fmt.Errorf("composition_id must be a UUID")
+		}
+		predicate = compositionIDFilter
+		params["composition_id"] = cid
+	}
+
+	query := strings.Replace(eventsSQLTemplate, compositionPredicatePlaceholder, predicate, 1)
+	return query, params, nil
+}
 
 func handleEvents(cfg config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		rows, err := queryClickHouse(cfg, eventsSQL)
+		query, params, err := buildEventsQuery(r.URL.Query())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		rows, err := queryClickHouse(cfg, query, params)
 		if err != nil {
 			log.Printf("[/events] query error: %v", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
@@ -395,7 +526,14 @@ func handleSSE(h *hub) http.HandlerFunc {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
 
-		c := &client{ch: make(chan sseMessage, 64)}
+		// Optional per-composition subscription. When composition_id is present
+		// the client receives ONLY that composition's events (the poller
+		// broadcasts them under topic == composition_id). When absent the client
+		// subscribes to the global firehose and filters client-side by event
+		// name, the original behaviour.
+		topic := r.URL.Query().Get("composition_id")
+
+		c := &client{ch: make(chan sseMessage, 64), topic: topic}
 		h.register(c)
 		defer h.unregister(c)
 
@@ -431,6 +569,8 @@ func handleSSE(h *hub) http.HandlerFunc {
 
 func main() {
 	cfg := loadConfig()
+	auth := loadAuthConfig()
+	auth.logStatus()
 	h := newHub()
 	p := newPoller(cfg, h)
 
@@ -440,9 +580,12 @@ func main() {
 	go p.run(ctx)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/events", handleEvents(cfg))
-	mux.HandleFunc("/notifications/", handleSSE(h))
-	mux.HandleFunc("/notifications", handleSSE(h))
+	// /events takes the JWT in the Authorization header (RESTAction forwards it);
+	// /notifications additionally accepts it via cookie/query param (EventSource
+	// cannot set headers). /health stays unauthenticated for k8s probes.
+	mux.HandleFunc("/events", auth.requireBearer(handleEvents(cfg)))
+	mux.HandleFunc("/notifications/", auth.requireSSEToken(handleSSE(h)))
+	mux.HandleFunc("/notifications", auth.requireSSEToken(handleSSE(h)))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "ok")
