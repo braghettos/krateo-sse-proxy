@@ -54,7 +54,7 @@ func TestBuildEventsQuery_NoParams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.Contains(q, "composition-id'] = {composition_id") {
+	if strings.Contains(q, "involvedObject', 'uid') = {composition_id") {
 		t.Errorf("query should not contain composition predicate when unfiltered:\n%s", q)
 	}
 	if _, ok := params["composition_id"]; ok {
@@ -74,7 +74,7 @@ func TestBuildEventsQuery_WithValidComposition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(q, "LogAttributes['krateo.io/composition-id'] = {composition_id:String}") {
+	if !strings.Contains(q, "JSONExtractString(Body, 'object', 'involvedObject', 'uid') = {composition_id:String}") {
 		t.Errorf("query must contain the bound composition predicate:\n%s", q)
 	}
 	if params["composition_id"] != cid {
