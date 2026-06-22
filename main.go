@@ -435,8 +435,12 @@ LIMIT {limit:UInt32}
 FORMAT JSONEachRow`
 
 // compositionIDFilter is the predicate appended to the WHERE clause when a
-// composition_id is supplied. The value is bound, not interpolated.
-const compositionIDFilter = "\n  AND LogAttributes['krateo.io/composition-id'] = {composition_id:String}"
+// composition_id is supplied. It keys on the event's own involvedObject uid
+// (the composition CR's uid) — NOT LogAttributes['krateo.io/composition-id'],
+// which the collector resolves to the *owning* composition (and only for
+// pod-associated objects), so it is absent/wrong for top-level compositions
+// like user blueprints. The value is bound, not interpolated.
+const compositionIDFilter = "\n  AND JSONExtractString(Body, 'object', 'involvedObject', 'uid') = {composition_id:String}"
 
 // uuidRe matches an RFC 4122 UUID (the shape of a krateo composition id),
 // case-insensitively. Used to reject anything that is not a UUID before the
