@@ -19,7 +19,7 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -171,10 +171,13 @@ func (a authConfig) requireSSEToken(next http.HandlerFunc) http.HandlerFunc {
 // ever printing the secret itself.
 func (a authConfig) logStatus() {
 	if a.enabled() {
-		log.Printf("[sse-proxy] auth ENABLED (HS256 via %s); SSE token via Authorization header, %q cookie, or ?access_token=/?token=",
-			envJWTSignKey, a.sessionCookie)
+		slogInfo("sse-proxy", "auth ENABLED (HS256); SSE token via Authorization header, cookie, or ?access_token=/?token=",
+			slog.String("sign_key_env", envJWTSignKey),
+			slog.String("session_cookie", a.sessionCookie),
+		)
 	} else {
-		log.Printf("[sse-proxy] auth DISABLED (%s unset) — all endpoints are open; set %s to enforce JWT validation",
-			envJWTSignKey, envJWTSignKey)
+		slogInfo("sse-proxy", "auth DISABLED — all endpoints are open; set the sign key env to enforce JWT validation",
+			slog.String("sign_key_env", envJWTSignKey),
+		)
 	}
 }
