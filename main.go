@@ -28,7 +28,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -39,6 +39,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // ---------------------------------------------------------------------------
@@ -251,14 +253,18 @@ FORMAT JSONEachRow`
 type poller struct {
 	cfg          config
 	hub          *hub
+	metrics      *proxyMetrics
+	client       *http.Client
 	lastSeenUnix int64
 }
 
-func newPoller(cfg config, h *hub) *poller {
+func newPoller(cfg config, h *hub, m *proxyMetrics, client *http.Client) *poller {
 	// Initialise to one hour ago to surface recent events on startup.
 	return &poller{
 		cfg:          cfg,
 		hub:          h,
+		metrics:      m,
+		client:       client,
 		lastSeenUnix: time.Now().Add(-1 * time.Hour).Unix(),
 	}
 }
@@ -275,20 +281,22 @@ func (p *poller) run(ctx context.Context) {
 				// No clients connected – skip the poll to avoid unnecessary load.
 				continue
 			}
-			p.poll()
+			p.poll(ctx)
 		}
 	}
 }
 
-func (p *poller) poll() {
+func (p *poller) poll(ctx context.Context) {
 	query := fmt.Sprintf(pollSQL, p.lastSeenUnix)
-	rows, err := queryClickHouse(p.cfg, query, nil)
+	rows, err := queryClickHouse(ctx, p.client, p.cfg, query, nil)
 	if err != nil {
-		log.Printf("[poller] query error: %v", err)
+		p.metrics.incPollError(ctx)
+		slogErrorCtx(ctx, "poller", "clickhouse query failed", err)
 		return
 	}
 
 	maxTs := p.lastSeenUnix
+	var delivered int64
 	for _, row := range rows {
 		if row.TsUnix > maxTs {
 			maxTs = row.TsUnix
@@ -297,13 +305,14 @@ func (p *poller) poll() {
 		evt := row.toSSEK8sEvent()
 		data, err := json.Marshal(evt)
 		if err != nil {
-			log.Printf("[poller] marshal error: %v", err)
+			slogErrorCtx(ctx, "poller", "event marshal failed", err)
 			continue
 		}
 
 		// Global topic — mirrors eventsse behaviour where all events
 		// are published under the "krateo" topic.
 		p.hub.broadcast(sseMessage{topic: "krateo", data: data})
+		delivered++
 
 		// Composition-specific topic so per-composition listeners
 		// only receive their own events.
@@ -316,7 +325,11 @@ func (p *poller) poll() {
 		p.lastSeenUnix = maxTs
 	}
 	if len(rows) > 0 {
-		log.Printf("[poller] broadcasted %d event(s), lastSeen=%d", len(rows), p.lastSeenUnix)
+		p.metrics.addEventsDelivered(ctx, delivered)
+		slogInfoCtx(ctx, "poller", "broadcasted events",
+			slog.Int("count", len(rows)),
+			slog.Int64("last_seen", p.lastSeenUnix),
+		)
 	}
 }
 
@@ -328,7 +341,10 @@ func (p *poller) poll() {
 // passed as ClickHouse query parameters (param_<name>=<value> on the request
 // URL) so the SQL can reference them safely as {name:Type} placeholders —
 // values are bound by ClickHouse, never string-concatenated into the SQL.
-func queryClickHouse(cfg config, query string, params map[string]string) ([]chRow, error) {
+func queryClickHouse(ctx context.Context, client *http.Client, cfg config, query string, params map[string]string) ([]chRow, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
 	endpoint := cfg.clickhouseURL
 	if len(params) > 0 {
 		u, err := url.Parse(cfg.clickhouseURL)
@@ -343,7 +359,9 @@ func queryClickHouse(cfg config, query string, params map[string]string) ([]chRo
 		endpoint = u.String()
 	}
 
-	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(query))
+	// NewRequestWithContext so the otelhttp transport (when installed) can
+	// create a client span and inject the W3C traceparent into the request.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(query))
 	if err != nil {
 		return nil, err
 	}
@@ -352,7 +370,7 @@ func queryClickHouse(cfg config, query string, params map[string]string) ([]chRo
 		req.SetBasicAuth(cfg.clickhouseUser, cfg.clickhousePassword)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("http request: %w", err)
 	}
@@ -373,7 +391,7 @@ func queryClickHouse(cfg config, query string, params map[string]string) ([]chRo
 		}
 		var row chRow
 		if err := json.Unmarshal([]byte(line), &row); err != nil {
-			log.Printf("[query] unmarshal error: %v (line=%s)", err, line)
+			slogErrorCtx(ctx, "query", "row unmarshal failed", err, slog.String("line", line))
 			continue
 		}
 		rows = append(rows, row)
@@ -484,17 +502,18 @@ func buildEventsQuery(q url.Values) (string, map[string]string, error) {
 	return query, params, nil
 }
 
-func handleEvents(cfg config) http.HandlerFunc {
+func handleEvents(cfg config, client *http.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
 		query, params, err := buildEventsQuery(r.URL.Query())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		rows, err := queryClickHouse(cfg, query, params)
+		rows, err := queryClickHouse(ctx, client, cfg, query, params)
 		if err != nil {
-			log.Printf("[/events] query error: %v", err)
+			slogErrorCtx(ctx, "events", "clickhouse query failed", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
@@ -507,7 +526,7 @@ func handleEvents(cfg config) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if err := json.NewEncoder(w).Encode(events); err != nil {
-			log.Printf("[/events] encode error: %v", err)
+			slogErrorCtx(ctx, "events", "response encode failed", err)
 		}
 	}
 }
@@ -572,22 +591,56 @@ func handleSSE(h *hub) http.HandlerFunc {
 // ---------------------------------------------------------------------------
 
 func main() {
+	// Structured JSON logging as the process default (non-gated; parity with
+	// authn/snowplow). Done first so every subsequent line is structured.
+	initLogging()
+
 	cfg := loadConfig()
 	auth := loadAuthConfig()
 	auth.logStatus()
 	h := newHub()
-	p := newPoller(cfg, h)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// OTel setup is gated default-OFF (OTEL_TRACING_ENABLED / OTEL_METRICS_ENABLED).
+	// When both are off this installs nothing and the wrappers below are skipped,
+	// keeping the binary byte-identical in behaviour to the pre-OTel version.
+	tel, shutdownTel := setupTelemetry(ctx)
+	defer func() {
+		shutdownCtx, c := context.WithTimeout(context.Background(), 5*time.Second)
+		defer c()
+		if err := shutdownTel(shutdownCtx); err != nil {
+			slogError("telemetry", "shutdown error", err)
+		}
+	}()
+	tel.logStatus()
+
+	// Metrics instruments register on the global MeterProvider, which is a no-op
+	// unless metrics are enabled — safe to init unconditionally.
+	metrics, err := initMetrics(h)
+	if err != nil {
+		slogError("telemetry", "metric instrument init failed", err)
+		metrics = nil
+	}
+
+	// Outbound HTTP client for the poller / events queries. When tracing is on,
+	// wrap the transport with otelhttp so calls to ClickHouse are client-spanned
+	// and propagate the W3C traceparent; otherwise use the default transport
+	// unchanged.
+	outboundClient := &http.Client{}
+	if tel.tracingEnabled {
+		outboundClient.Transport = otelhttp.NewTransport(http.DefaultTransport)
+	}
+
+	p := newPoller(cfg, h, metrics, outboundClient)
 	go p.run(ctx)
 
 	mux := http.NewServeMux()
 	// /events takes the JWT in the Authorization header (RESTAction forwards it);
 	// /notifications additionally accepts it via cookie/query param (EventSource
 	// cannot set headers). /health stays unauthenticated for k8s probes.
-	mux.HandleFunc("/events", auth.requireBearer(handleEvents(cfg)))
+	mux.HandleFunc("/events", auth.requireBearer(handleEvents(cfg, outboundClient)))
 	mux.HandleFunc("/notifications/", auth.requireSSEToken(handleSSE(h)))
 	mux.HandleFunc("/notifications", auth.requireSSEToken(handleSSE(h)))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
@@ -595,9 +648,27 @@ func main() {
 		fmt.Fprint(w, "ok")
 	})
 
+	// When tracing is on, wrap the whole mux with otelhttp so inbound requests
+	// get a server span and the browser's traceparent is extracted into the
+	// request context. /health is filtered out (noise). The SSE handler keeps
+	// its own http.Flusher behaviour intact: otelhttp.NewHandler does not buffer
+	// the response — it wraps the ResponseWriter while preserving the Flusher
+	// interface — so the long-lived stream still flushes per message. The server
+	// span for an SSE connection therefore spans the connection lifetime (it
+	// ends when the client disconnects); the short-lived /events fetch gets a
+	// normal request-scoped span.
+	var handler http.Handler = mux
+	if tel.tracingEnabled {
+		handler = otelhttp.NewHandler(mux, "sse-proxy",
+			otelhttp.WithFilter(func(r *http.Request) bool {
+				return r.URL.Path != "/health"
+			}),
+		)
+	}
+
 	srv := &http.Server{
 		Addr:    cfg.listenAddr,
-		Handler: mux,
+		Handler: handler,
 	}
 
 	// Graceful shutdown on SIGTERM/SIGINT (Kubernetes sends SIGTERM on pod stop).
@@ -605,18 +676,19 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		sig := <-sigCh
-		log.Printf("[sse-proxy] received %v, shutting down gracefully...", sig)
+		slogInfo("sse-proxy", "received signal, shutting down gracefully", slog.String("signal", sig.String()))
 		cancel()
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			log.Printf("[sse-proxy] shutdown error: %v", err)
+			slogError("sse-proxy", "http shutdown error", err)
 		}
 	}()
 
-	log.Printf("[sse-proxy] listening on %s", cfg.listenAddr)
+	slogInfo("sse-proxy", "listening", slog.String("addr", cfg.listenAddr))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("[sse-proxy] fatal: %v", err)
+		slogError("sse-proxy", "fatal server error", err)
+		os.Exit(1)
 	}
-	log.Println("[sse-proxy] stopped")
+	slogInfo("sse-proxy", "stopped")
 }
