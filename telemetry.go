@@ -1,7 +1,9 @@
 // OpenTelemetry wiring for the SSE proxy.
 //
-// Everything here is GATED and DEFAULT-OFF. With neither OTEL_TRACING_ENABLED
-// nor OTEL_METRICS_ENABLED set to a truthy value, Setup registers NOTHING: no
+// Everything here is GATED and DEFAULT-OFF. The master gate is OTEL_ENABLED;
+// OTEL_TRACING_ENABLED and OTEL_METRICS_ENABLED each default to OTEL_ENABLED
+// when unset and override it when set. With the master off and neither
+// per-signal flag set to a truthy value, Setup registers NOTHING: no
 // exporters, no global TracerProvider/MeterProvider, no propagator. In that
 // state the otelhttp handler/transport wrappers (also gated by the same flags
 // at their call sites) are never installed, so the binary behaves byte-for-byte
@@ -35,6 +37,11 @@ const (
 	// serviceName is the OTel resource service.name for this process.
 	serviceName = "sse-proxy"
 
+	// envEnabledMaster is the master gate for all OTel signals. It is the
+	// default for the per-signal flags below: when OTEL_ENABLED is truthy and a
+	// per-signal flag is unset, that signal is on. A per-signal flag, when set,
+	// always wins over the master. Default-OFF: unset ⇒ everything off.
+	envEnabledMaster  = "OTEL_ENABLED"
 	envTracingEnabled = "OTEL_TRACING_ENABLED"
 	envMetricsEnabled = "OTEL_METRICS_ENABLED"
 )
@@ -49,6 +56,7 @@ type telemetry struct {
 // logStatus emits a one-line summary of the OTel posture at startup.
 func (t telemetry) logStatus() {
 	slogInfo("telemetry", "otel status",
+		slog.Bool("enabled", envEnabled(envEnabledMaster)),
 		slog.Bool("tracing_enabled", t.tracingEnabled),
 		slog.Bool("metrics_enabled", t.metricsEnabled),
 		slog.String("endpoint", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")),
@@ -62,13 +70,29 @@ func envEnabled(key string) bool {
 	return err == nil && v
 }
 
+// envEnabledOr reports whether key is truthy, defaulting to fallback when key
+// is unset/empty. A set-but-unparseable value is treated as false (off). This
+// is how a per-signal flag (OTEL_TRACING_ENABLED / OTEL_METRICS_ENABLED) takes
+// its default from the master (OTEL_ENABLED) yet still wins when set.
+func envEnabledOr(key string, fallback bool) bool {
+	raw, ok := os.LookupEnv(key)
+	if !ok || raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseBool(raw)
+	return err == nil && v
+}
+
 // Setup resolves the gating flags and, when enabled, installs the global OTel
 // TracerProvider / MeterProvider and the W3C propagator. The returned shutdown
 // func flushes and stops whatever was installed (a no-op when nothing was).
 func setupTelemetry(ctx context.Context) (telemetry, func(context.Context) error) {
+	// Master gate (default-OFF) is the default for each per-signal flag; a
+	// per-signal flag, when set, overrides the master.
+	master := envEnabled(envEnabledMaster)
 	t := telemetry{
-		tracingEnabled: envEnabled(envTracingEnabled),
-		metricsEnabled: envEnabled(envMetricsEnabled),
+		tracingEnabled: envEnabledOr(envTracingEnabled, master),
+		metricsEnabled: envEnabledOr(envMetricsEnabled, master),
 	}
 
 	// Nothing enabled ⇒ register nothing; keep the otel no-op globals.
